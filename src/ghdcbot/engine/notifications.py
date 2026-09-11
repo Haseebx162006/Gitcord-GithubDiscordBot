@@ -503,34 +503,30 @@ def send_issue_opened_channel_notification(
     if issue_number is None:
         return False
 
-    assignee_raw = event.payload.get("assignee")
-    assignee_github = (
-        str(assignee_raw).strip()
-        if isinstance(assignee_raw, str) and assignee_raw.strip()
-        else None
-    )
-    if assignee_github and _is_github_bot_login(assignee_github):
-        assignee_github = None
+    assignee_githubs = _assignees_from_issue_payload(event.payload)
+    assignee_stored = _serialize_assignees(assignee_githubs)
 
     author_discord_id = _resolve_github_to_discord(storage, author_github)
-    assignee_discord_id = (
-        _resolve_github_to_discord(storage, assignee_github) if assignee_github else None
-    )
+    assignee_entries = [
+        (gh, _resolve_github_to_discord(storage, gh)) for gh in assignee_githubs
+    ]
 
     dedupe_key = f"issue_opened_channel:{event.repo}:{issue_number}:{channel_id}"
-    message = _build_issue_channel_message(
+    message_built = _build_issue_channel_message(
         github_org=github_org,
         repo=event.repo,
         issue_number=int(issue_number),
         title=event.payload.get("title") or "Untitled",
         author_github=author_github,
         author_discord_id=author_discord_id,
-        assignee_github=assignee_github,
-        assignee_discord_id=assignee_discord_id,
+        assignees=assignee_entries,
         status="open",
         closed_by_github=None,
         include_link_nudge=author_discord_id is None,
     )
+    if not message_built:
+        return False
+    message, _embeds = message_built
     if not message:
         return False
 
@@ -587,7 +583,7 @@ def send_issue_opened_channel_notification(
                         message_id=message_id,
                         issue_title=event.payload.get("title"),
                         author_github=author_github,
-                        assignee_github=assignee_github,
+                        assignee_github=assignee_stored,
                         status="open",
                     )
                 except Exception as exc:
@@ -615,13 +611,19 @@ def update_issue_channel_announcement_for_event(
     config: NotificationConfig,
     github_org: str,
 ) -> bool:
-    """Edit a tracked issue channel message on assign or close.
+    """Edit a tracked issue channel message on assign, unassign, close, or reopen.
 
-    Keeps Opened by always; Assigned to is None or the contributor; close adds Closed by.
+    Open posts list Opened by / assignees; closed posts show only Closed by.
+    Reopen restores the open announcement from tracked author/assignees.
     """
     if not config.enabled or not getattr(config, "update_issue_channel_on_lifecycle", True):
         return False
-    if event.event_type not in {"issue_assigned", "issue_closed"}:
+    if event.event_type not in {
+        "issue_assigned",
+        "issue_unassigned",
+        "issue_closed",
+        "issue_reopened",
+    }:
         return False
     if not policy.allow_discord_mutations:
         return False
@@ -646,21 +648,49 @@ def update_issue_channel_announcement_for_event(
         return False
 
     author_github = (tracked.get("author_github") or "").strip() or "unknown"
-    assignee_github = tracked.get("assignee_github")
+    assignees = _parse_assignees(tracked.get("assignee_github"))
     status = tracked.get("status") or "open"
     closed_by_github: str | None = None
+    audit_actor = author_github
+    clear_assignee = False
 
     if event.event_type == "issue_assigned":
-        if status == "closed":
-            # Keep closed announcement (incl. Closed by) unchanged after late assigns.
+        if status == "closed" or _payload_issue_state_is_closed(event):
+            # Keep closed announcement unchanged (tracked or payload says closed).
             return False
         new_assignee = (event.github_user or "").strip()
         if not new_assignee or _is_github_bot_login(new_assignee):
             return False
-        if (assignee_github or "").strip().lower() == new_assignee.lower() and status == "open":
+        if any(a.lower() == new_assignee.lower() for a in assignees):
             return False
-        assignee_github = new_assignee
+        assignees.append(new_assignee)
+        audit_actor = new_assignee
         dedupe_key = f"issue_channel_assign:{event.repo}:{issue_number}:{new_assignee.lower()}"
+    elif event.event_type == "issue_unassigned":
+        if status == "closed" or _payload_issue_state_is_closed(event):
+            return False
+        removed = (event.github_user or "").strip()
+        if not removed:
+            return False
+        if not any(a.lower() == removed.lower() for a in assignees):
+            return False
+        assignees = [a for a in assignees if a.lower() != removed.lower()]
+        clear_assignee = not assignees
+        audit_actor = removed
+        unassigned_at = event.payload.get("unassigned_at") or event.created_at.isoformat()
+        dedupe_key = (
+            f"issue_channel_unassign:{event.repo}:{issue_number}:"
+            f"{removed.lower()}:{unassigned_at}"
+        )
+    elif event.event_type == "issue_reopened":
+        if status == "open":
+            return False
+        status = "open"
+        audit_actor = author_github
+        reopened_at = event.payload.get("reopened_at") or event.created_at.isoformat()
+        dedupe_key = (
+            f"issue_channel_lifecycle:{event.repo}:{issue_number}:open:{reopened_at}"
+        )
     else:
         if status == "closed":
             return False
@@ -670,32 +700,34 @@ def update_issue_channel_announcement_for_event(
             or (event.github_user or "").strip()
             or None
         )
+        audit_actor = closed_by_github or author_github
         dedupe_key = f"issue_channel_lifecycle:{event.repo}:{issue_number}:closed"
 
     author_discord_id = _resolve_github_to_discord(storage, author_github)
-    assignee_discord_id = (
-        _resolve_github_to_discord(storage, assignee_github) if assignee_github else None
-    )
+    assignee_entries = [
+        (gh, _resolve_github_to_discord(storage, gh)) for gh in assignees
+    ]
+    assignee_stored = _serialize_assignees(assignees)
     title = (
         event.payload.get("title")
         or tracked.get("issue_title")
         or "Untitled"
     )
-    message = _build_issue_channel_message(
+    message_built = _build_issue_channel_message(
         github_org=github_org,
         repo=event.repo,
         issue_number=int(issue_number),
         title=title,
         author_github=author_github,
         author_discord_id=author_discord_id,
-        assignee_github=assignee_github if isinstance(assignee_github, str) else None,
-        assignee_discord_id=assignee_discord_id,
+        assignees=assignee_entries,
         status=status,
         closed_by_github=closed_by_github,
         include_link_nudge=False,
     )
-    if not message:
+    if not message_built:
         return False
+    message, embeds = message_built
 
     try:
         claimed = _claim_notification_sent(
@@ -704,7 +736,7 @@ def update_issue_channel_announcement_for_event(
             event,
             "",
             tracked.get("channel_id"),
-            closed_by_github or assignee_github or author_github,
+            audit_actor,
         )
     except Exception as exc:
         logger.warning(
@@ -727,16 +759,22 @@ def update_issue_channel_announcement_for_event(
                 str(tracked["channel_id"]),
                 str(tracked["message_id"]),
                 message,
+                embeds=embeds,
             )
         )
     except TypeError:
+        # Older DiscordWriter mocks/adapters without embeds kwarg.
+        if embeds:
+            emb = embeds[0]
+            fallback = f"**{emb.get('title', '')}**\n\n{emb.get('description', '')}".strip()
+        else:
+            fallback = message or ""
         try:
             edited = bool(
                 edit_msg(
                     str(tracked["channel_id"]),
                     str(tracked["message_id"]),
-                    message,
-                    embeds=None,
+                    fallback,
                 )
             )
         except Exception as exc:
@@ -771,7 +809,29 @@ def update_issue_channel_announcement_for_event(
                 update(
                     event.repo,
                     int(issue_number),
-                    assignee_github=assignee_github,
+                    assignee_github=assignee_stored,
+                    issue_title=str(title) if title else None,
+                )
+            elif event.event_type == "issue_unassigned":
+                if clear_assignee:
+                    update(
+                        event.repo,
+                        int(issue_number),
+                        clear_assignee=True,
+                        issue_title=str(title) if title else None,
+                    )
+                else:
+                    update(
+                        event.repo,
+                        int(issue_number),
+                        assignee_github=assignee_stored,
+                        issue_title=str(title) if title else None,
+                    )
+            elif event.event_type == "issue_reopened":
+                update(
+                    event.repo,
+                    int(issue_number),
+                    status="open",
                     issue_title=str(title) if title else None,
                 )
             else:
@@ -795,9 +855,59 @@ def update_issue_channel_announcement_for_event(
         event,
         "",
         tracked.get("channel_id"),
-        closed_by_github or assignee_github or author_github,
+        audit_actor,
     )
+    # Release status-/user-keyed claims so assign ↔ unassign ↔ re-assign cycles work
+    # (tracked assignee_github already prevents duplicate no-op edits).
+    _release_notification_claim(storage, dedupe_key)
     return True
+
+
+def _payload_issue_state_is_closed(event: ContributionEvent) -> bool:
+    """True when the GitHub issue payload reports state=closed."""
+    state = str((event.payload or {}).get("state") or "").strip().lower()
+    return state == "closed"
+
+
+def _parse_assignees(raw: object) -> list[str]:
+    """Parse stored assignee field (single login or comma-separated list)."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        out: list[str] = []
+        seen: set[str] = set()
+        for entry in raw:
+            login = str(entry or "").strip()
+            if not login or login.lower() in seen or _is_github_bot_login(login):
+                continue
+            out.append(login)
+            seen.add(login.lower())
+        return out
+    text = str(raw).strip()
+    if not text:
+        return []
+    out = []
+    seen = set()
+    for part in text.split(","):
+        login = part.strip()
+        if not login or login.lower() in seen or _is_github_bot_login(login):
+            continue
+        out.append(login)
+        seen.add(login.lower())
+    return out
+
+
+def _serialize_assignees(assignees: list[str]) -> str | None:
+    cleaned = _parse_assignees(assignees)
+    return ",".join(cleaned) if cleaned else None
+
+
+def _assignees_from_issue_payload(payload: dict) -> list[str]:
+    """Prefer full assignees list from payload; fall back to singular assignee."""
+    raw_list = payload.get("assignees")
+    if isinstance(raw_list, list) and raw_list:
+        return _parse_assignees(raw_list)
+    return _parse_assignees(payload.get("assignee"))
 
 
 def _format_github_discord_person(github_user: str, discord_user_id: str | None) -> str:
@@ -805,6 +915,11 @@ def _format_github_discord_person(github_user: str, discord_user_id: str | None)
     if discord_user_id:
         return f"{gh} - <@{discord_user_id}>"
     return f"{gh} - unknown"
+
+
+# GitHub Primer status colors (match PR badge hues in the GitHub UI).
+_GITHUB_MERGED_PURPLE = 0x8250DF  # Primer done/merged
+_GITHUB_CLOSED_RED = 0xCF222E  # Primer danger/closed
 
 
 def _build_issue_channel_message(
@@ -815,41 +930,53 @@ def _build_issue_channel_message(
     title: str,
     author_github: str,
     author_discord_id: str | None,
-    assignee_github: str | None,
-    assignee_discord_id: str | None,
+    assignees: list[tuple[str, str | None]],
     status: str,
     closed_by_github: str | None,
     include_link_nudge: bool,
-) -> str | None:
-    """Build issue channel announcement text (open or closed)."""
-    issue_title = _sanitize_discord_pr_title(title)
-    url = _suppress_discord_embed(
-        f"https://github.com/{github_org}/{repo}/issues/{issue_number}"
-    )
-    if status == "closed":
-        header = f"🔒 **Closed: [{repo} #{issue_number} — {issue_title}]({url})**"
-    else:
-        header = f"🆕 **New Issue: [{repo} #{issue_number} — {issue_title}]({url})**"
+) -> tuple[str, list[dict]] | None:
+    """Build issue channel announcement content + embeds.
 
+    Open posts: plain text (Opened by / Assigned to). Closed posts: red embed
+    card matching PR close styling (empty content so Discord shows one box).
+    """
+    issue_title = _sanitize_discord_pr_title(title)
+    raw_url = f"https://github.com/{github_org}/{repo}/issues/{issue_number}"
+    if status == "closed":
+        closer = (closed_by_github or "").lstrip("@").strip()
+        status_line = (
+            f"**Status:** Closed by @{closer}" if closer else "**Status:** Closed"
+        )
+        embed_title = f"Closed: {repo} #{issue_number} — {issue_title}"
+        if len(embed_title) > 256:
+            embed_title = embed_title[:253] + "..."
+        embeds = [
+            {
+                "title": embed_title,
+                "url": raw_url,
+                "description": status_line,
+                "color": _GITHUB_CLOSED_RED,
+            }
+        ]
+        return "", embeds
+
+    url = _suppress_discord_embed(raw_url)
+    header = f"🆕 **New Issue: [{repo} #{issue_number} — {issue_title}]({url})**"
     opened_line = (
         f"**Opened by:** {_format_github_discord_person(author_github, author_discord_id)}"
     )
-    if assignee_github:
-        assigned_line = (
-            "**Assigned to:** "
-            f"{_format_github_discord_person(assignee_github, assignee_discord_id)}"
-        )
+    people = [
+        _format_github_discord_person(gh, did)
+        for gh, did in assignees
+        if (gh or "").strip()
+    ]
+    if people:
+        assigned_line = f"**Assigned to:** {', '.join(people)}"
     else:
         assigned_line = "**Assigned to:** None"
 
     lines = [header, "", opened_line, assigned_line]
-    if status == "closed":
-        closer = (closed_by_github or "").lstrip("@").strip()
-        if closer:
-            lines.append(f"**Status:** Closed by @{closer}")
-        else:
-            lines.append("**Status:** Closed")
-    elif include_link_nudge:
+    if include_link_nudge:
         lines.extend(
             [
                 "",
@@ -859,7 +986,7 @@ def _build_issue_channel_message(
                 ),
             ]
         )
-    return "\n".join(lines)
+    return "\n".join(lines), []
 
 
 def _pr_lifecycle_actor(event: ContributionEvent) -> str | None:
@@ -881,11 +1008,6 @@ def _pr_lifecycle_actor(event: ContributionEvent) -> str | None:
     )
     actor = str(actor).strip()
     return actor or None
-
-
-# GitHub Primer status colors (match PR badge hues in the GitHub UI).
-_GITHUB_MERGED_PURPLE = 0x8250DF  # Primer done/merged
-_GITHUB_CLOSED_RED = 0xCF222E  # Primer danger/closed
 
 
 def _build_pr_lifecycle_channel_message(

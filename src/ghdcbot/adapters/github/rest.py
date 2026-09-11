@@ -1625,12 +1625,13 @@ class GitHubRestAdapter:
     def _issue_assignment_events(
         self, owner: str, repo: str, issue: dict, since: datetime, timeline_events: list[dict]
     ) -> Iterable[ContributionEvent]:
-        """Emit issue_assigned events from pre-fetched timeline data."""
+        """Emit issue_assigned / issue_unassigned events from pre-fetched timeline data."""
         issue_number = issue.get("number")
         if not issue_number:
             return
         for event in timeline_events:
-            if event.get("event") != "assigned":
+            event_name = event.get("event")
+            if event_name not in {"assigned", "unassigned"}:
                 continue
             created_at = _parse_iso8601(event.get("created_at"))
             if not created_at or created_at < since:
@@ -1644,12 +1645,17 @@ class GitHubRestAdapter:
             payload = _issue_payload(issue)
             actor = event.get("actor")
             if actor and isinstance(actor, dict):
-                assigned_by = actor.get("login")
-                if assigned_by:
-                    payload["assigned_by"] = assigned_by
+                actor_login = actor.get("login")
+                if actor_login:
+                    if event_name == "assigned":
+                        payload["assigned_by"] = actor_login
+                    else:
+                        payload["unassigned_by"] = actor_login
+            if event_name == "unassigned" and event.get("created_at"):
+                payload["unassigned_at"] = event.get("created_at")
             yield ContributionEvent(
                 github_user=assignee_login,
-                event_type="issue_assigned",
+                event_type="issue_assigned" if event_name == "assigned" else "issue_unassigned",
                 repo=repo,
                 created_at=created_at,
                 payload=payload,
@@ -1690,6 +1696,18 @@ class GitHubRestAdapter:
                 [assignee_login] if assignee_login else []
             )
             if not assignees_to_notify:
+                # Still emit one reopen for channel lifecycle; DM is skipped (no assignee).
+                payload = _issue_payload(issue)
+                payload["reopened_at"] = event.get("created_at")
+                actor = event.get("actor") if isinstance(event.get("actor"), dict) else None
+                actor_login = (actor.get("login") if actor else None) or "unknown"
+                yield ContributionEvent(
+                    github_user=actor_login,
+                    event_type="issue_reopened",
+                    repo=repo,
+                    created_at=created_at,
+                    payload=payload,
+                )
                 continue
 
             for resolved_assignee in assignees_to_notify:
@@ -2242,16 +2260,25 @@ def _issue_payload(issue: dict) -> dict:
         "state": issue.get("state"),
         "labels": [label.get("name") for label in issue.get("labels") or []],
     }
+    logins: list[str] = []
+    seen: set[str] = set()
     assignee = issue.get("assignee")
     if isinstance(assignee, dict) and assignee.get("login"):
-        payload["assignee"] = assignee["login"]
-    else:
-        assignees = issue.get("assignees") or []
-        if isinstance(assignees, list):
-            for entry in assignees:
-                if isinstance(entry, dict) and entry.get("login"):
-                    payload["assignee"] = entry["login"]
-                    break
+        login = str(assignee["login"]).strip()
+        if login:
+            logins.append(login)
+            seen.add(login.lower())
+    for entry in issue.get("assignees") or []:
+        if not isinstance(entry, dict):
+            continue
+        login = str(entry.get("login") or "").strip()
+        if not login or login.lower() in seen:
+            continue
+        logins.append(login)
+        seen.add(login.lower())
+    if logins:
+        payload["assignee"] = logins[0]
+        payload["assignees"] = logins
     closed_by = issue.get("closed_by")
     if isinstance(closed_by, dict) and closed_by.get("login"):
         payload["closed_by"] = closed_by["login"]

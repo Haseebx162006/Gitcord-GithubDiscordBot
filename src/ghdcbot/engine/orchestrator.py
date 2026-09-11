@@ -273,22 +273,16 @@ class Orchestrator:
                 close()
 
 
-def _notification_event_sort_key(event: ContributionEvent) -> tuple:
-    """Sort key so Discord notifications go out in chronological open/activity order.
+def _notification_event_sort_key(event: ContributionEvent) -> datetime:
+    """Sort key so Discord notifications go out in chronological order.
 
-    Ingestion often yields GitHub API order (newest-first within a repo). Sorting only
-    affects the notification pass — storage/cursor still use the original list.
+    Ingestion often yields GitHub API order (newest-first within a repo). Sorting
+    only affects the notification pass — storage/cursor still use the original list.
+
+    Equal timestamps keep ingestion order (stable sort) so timeline pairs like
+    unassign→assign at the same second are not reordered by event_type.
     """
-    payload = event.payload or {}
-    return (
-        event.created_at,
-        event.event_type,
-        event.repo,
-        str(payload.get("pr_number") or payload.get("issue_number") or ""),
-        event.github_user or "",
-        # Final tie-breaker: equal-time pr_reviewed rows stay deterministic across ingest order.
-        str(payload.get("review_id") or ""),
-    )
+    return event.created_at
 
 
 def _send_notifications_for_new_events(
@@ -335,6 +329,7 @@ def _send_notifications_for_new_events(
             continue
         if event.event_type in {
             "issue_assigned",
+            "issue_unassigned",
             "issue_closed",
             "pr_reviewed",
             "pr_merged",
@@ -372,7 +367,12 @@ def _send_notifications_for_new_events(
                             "pr_number": event.payload.get("pr_number"),
                         },
                     )
-            if event.event_type in {"issue_assigned", "issue_closed"}:
+            if event.event_type in {
+                "issue_assigned",
+                "issue_unassigned",
+                "issue_closed",
+                "issue_reopened",
+            }:
                 try:
                     if update_issue_channel_announcement_for_event(
                         event, storage, discord_writer, policy, config, github_org
@@ -389,8 +389,8 @@ def _send_notifications_for_new_events(
                             "issue_number": event.payload.get("issue_number"),
                         },
                     )
-            if event.event_type == "issue_closed":
-                # Channel announcement only (no assignee DM for close today).
+            if event.event_type in {"issue_closed", "issue_unassigned"}:
+                # Channel announcement only (no DM for close / unassign today).
                 continue
             if send_notification_for_event(event, storage, discord_writer, policy, config, github_org):
                 sent_count += 1
