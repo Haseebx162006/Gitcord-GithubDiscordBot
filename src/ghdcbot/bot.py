@@ -1305,22 +1305,32 @@ def run_bot(config_path: str) -> None:
                 logger.exception("Failed to send permission denied message", exc_info=e)
                 # Try one more time with a simple message
                 try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(
-                            "❌ Permission denied. Only mentors can use this command.",
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "You do not have permission to use this command.",
                             ephemeral=True,
                         )
-                except Exception:
+                    else:
+                        await interaction.response.send_message(
+                            "You do not have permission to use this command.",
+                            ephemeral=True,
+                        )
+                except Exception:  # noqa: BLE001
                     logger.error("Could not send any error message to user")
         else:
             logger.exception("App command error", exc_info=error)
             try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "❌ An error occurred while processing your command.",
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "An unexpected error occurred. Please try again later.",
                         ephemeral=True,
                     )
-            except Exception:
+                else:
+                    await interaction.response.send_message(
+                        "An unexpected error occurred. Please try again later.",
+                        ephemeral=True,
+                    )
+            except Exception:  # noqa: BLE001
                 logger.error("Could not send error message to user")
 
     register_social_commands(tree, guild_id, social_service)
